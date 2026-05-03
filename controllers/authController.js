@@ -1,82 +1,125 @@
 const User = require("../models/User");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const registerUser = async (req,res) =>{
-    try{
-        const {name, email, password} = req.body;
-        if(!name || !email || !password){
-            return res.status(400).json({message: "All fields are required"});
-        }
-        const userExists = await User.findOne({email});
-        if(userExists){
-            return res.status(400).json({message: "User already exists"});
-        }
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-        const user = await User.create({name, email, password: hashedPassword});
-        const accessToken = jwt.sign({ id: user._id, name: user.name, email: user.email }, process.env.JWT_ACCESS_SECRET, {expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN});
-        const refreshToken = jwt.sign({ id: user._id, name: user.name, email: user.email }, process.env.JWT_REFRESH_SECRET, {expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN});
-        res.cookie("refreshToken", refreshToken, {httpOnly: true, secure: true, sameSite: "strict"});
-        res.status(201).json({message: "User created successfully", user, accessToken});
-    }catch(error){
-        console.log(error);
-        res.status(500).json({message: "Internal server error"});
-    }
-}
+const { createError } = require("../middleware/validateRequest");
 
-const loginUser = async (req,res) =>{
-    try{
-        const {email, password} = req.body;
-        if(!email || !password){
-            return res.status(400).json({message: "All fields are required"});
-        }
-        const user = await User.findOne({email});
-        if(!user){
-            return res.status(400).json({message: "User not found"});
-        }
-        const isPasswordCorrect = await bcrypt.compare(password, user.password);
-        if(!isPasswordCorrect){
-            return res.status(400).json({message: "Invalid password"});
-        }
-        const accessToken = jwt.sign({ id: user._id, name: user.name, email: user.email }, process.env.JWT_ACCESS_SECRET, {expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN});
-        const refreshToken = jwt.sign({ id: user._id, name: user.name, email: user.email }, process.env.JWT_REFRESH_SECRET, {expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN});
-        res.cookie("refreshToken", refreshToken, {httpOnly: true, secure: true, sameSite: "strict"});        
-        res.status(200).json({message: "Login successful", accessToken});
-    }catch(error){
-        console.log(error);
-        res.status(500).json({message: "Internal server error"});
-    }
-}
+const getCookieOptions = () => ({
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "strict",
+});
 
-const logoutUser = async (req,res) =>{
-    try{
-        res.clearCookie("refreshToken");
-        res.status(200).json({message: "Logout successful"});
-    }catch(error){
-        console.log(error);
-        res.status(500).json({message: "Internal server error"});
-    }
-}
+const buildTokenPayload = (user) => ({
+  id: user._id,
+  name: user.name,
+  email: user.email,
+});
 
-const refresh = async (req,res) =>{
-    try{
-        console.log("refresh token", req.cookies);
-        const refrestToken = req.cookies.refreshToken;
-     
-        if(!refrestToken){
-            return res.status(401).json({message: "Unauthorized"});
-        }
-        const decoded = jwt.verify(refrestToken, process.env.JWT_REFRESH_SECRET);
-        if(!decoded){
-            return res.status(401).json({message: "Unauthorized"});
-        }
-        const accessToken = jwt.sign({ id: decoded.id, name: decoded.name, email: decoded.email }, process.env.JWT_ACCESS_SECRET, {expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN});
-        res.status(200).json({message: "Token refreshed", accessToken});
-    }catch(error){
-        console.log(error);
-        res.status(500).json({message: "Internal server error"});
-    }
-}
+const generateAccessToken = (user) =>
+  jwt.sign(buildTokenPayload(user), process.env.JWT_ACCESS_SECRET, {
+    expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN,
+  });
 
+const generateRefreshToken = (user) =>
+  jwt.sign(buildTokenPayload(user), process.env.JWT_REFRESH_SECRET, {
+    expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN,
+  });
 
-module.exports = { registerUser, loginUser, logoutUser, refresh };
+const sanitizeUser = (user) => ({
+  id: user._id,
+  name: user.name,
+  email: user.email,
+  createdAt: user.createdAt,
+  updatedAt: user.updatedAt,
+});
+
+const registerUser = async (req, res) => {
+  const { name, email, password } = req.body;
+  const normalizedEmail = email.trim().toLowerCase();
+  const trimmedName = name.trim();
+
+  const userExists = await User.findOne({ email: normalizedEmail });
+  if (userExists) {
+    throw createError("User already exists");
+  }
+
+  const salt = await bcrypt.genSalt(10);
+  const hashedPassword = await bcrypt.hash(password, salt);
+  const user = await User.create({
+    name: trimmedName,
+    email: normalizedEmail,
+    password: hashedPassword,
+  });
+
+  const accessToken = generateAccessToken(user);
+  const refreshToken = generateRefreshToken(user);
+
+  res.cookie("refreshToken", refreshToken, getCookieOptions());
+  return res.status(201).json({
+    message: "User created successfully",
+    user: sanitizeUser(user),
+    accessToken,
+  });
+};
+
+const loginUser = async (req, res) => {
+  const { email, password } = req.body;
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const user = await User.findOne({ email: normalizedEmail });
+  if (!user) {
+    throw createError("Invalid email or password", 401);
+  }
+
+  const isPasswordCorrect = await bcrypt.compare(password, user.password);
+  if (!isPasswordCorrect) {
+    throw createError("Invalid email or password", 401);
+  }
+
+  const accessToken = generateAccessToken(user);
+  const refreshToken = generateRefreshToken(user);
+
+  res.cookie("refreshToken", refreshToken, getCookieOptions());
+  return res.status(200).json({
+    message: "Login successful",
+    user: sanitizeUser(user),
+    accessToken,
+  });
+};
+
+const logoutUser = async (req, res) => {
+  res.clearCookie("refreshToken", getCookieOptions());
+  return res.status(200).json({ message: "Logout successful" });
+};
+
+const refresh = async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+
+  if (!refreshToken) {
+    throw createError("Unauthorized", 401);
+  }
+
+  const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+  const accessToken = jwt.sign(
+    { id: decoded.id, name: decoded.name, email: decoded.email },
+    process.env.JWT_ACCESS_SECRET,
+    { expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN }
+  );
+
+  return res.status(200).json({ message: "Token refreshed", accessToken });
+};
+
+const getCurrentUser = async (req, res) => {
+  const user = await User.findById(req.user.id).select("-password");
+
+  if (!user) {
+    throw createError("User not found", 404);
+  }
+
+  return res.status(200).json({
+    message: "User fetched successfully",
+    user: sanitizeUser(user),
+  });
+};
+
+module.exports = { registerUser, loginUser, logoutUser, refresh, getCurrentUser };
