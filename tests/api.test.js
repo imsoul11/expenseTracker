@@ -15,6 +15,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const {
   validateRegister,
   validateExpenseId,
+  validateExpenseQuery,
 } = require("../middleware/validateRequest");
 const {
   registerUser,
@@ -38,6 +39,7 @@ const originalUserMethods = {
 const originalExpenseMethods = {
   create: Expense.create,
   find: Expense.find,
+  countDocuments: Expense.countDocuments,
   findOneAndUpdate: Expense.findOneAndUpdate,
   findOneAndDelete: Expense.findOneAndDelete,
 };
@@ -55,6 +57,7 @@ const restoreMocks = () => {
 
   Expense.create = originalExpenseMethods.create;
   Expense.find = originalExpenseMethods.find;
+  Expense.countDocuments = originalExpenseMethods.countDocuments;
   Expense.findOneAndUpdate = originalExpenseMethods.findOneAndUpdate;
   Expense.findOneAndDelete = originalExpenseMethods.findOneAndDelete;
 
@@ -148,6 +151,88 @@ test("validateExpenseId rejects malformed Mongo ids", () => {
 
   assert.equal(next.calls.length, 1);
   assert.equal(next.calls[0].message, "Invalid expense id");
+});
+
+test("validateExpenseQuery rejects invalid pagination values", () => {
+  const req = {
+    query: {
+      page: "0",
+      limit: "10",
+    },
+  };
+  const next = createNext();
+
+  validateExpenseQuery(req, {}, next);
+
+  assert.equal(next.calls.length, 1);
+  assert.equal(next.calls[0].message, "page must be a positive integer");
+});
+
+test("validateExpenseQuery normalizes valid filter and sort values", () => {
+  const req = {
+    query: {
+      category: " Food ",
+      startDate: "2026-05-01T00:00:00.000Z",
+      endDate: "2026-05-31T23:59:59.999Z",
+      minAmount: "10",
+      maxAmount: "100",
+      page: "2",
+      limit: "5",
+      sortBy: "amount",
+      sortOrder: "asc",
+    },
+  };
+  const next = createNext();
+
+  validateExpenseQuery(req, {}, next);
+
+  assert.deepEqual(next.calls, [null]);
+  assert.equal(req.expenseQuery.category, "Food");
+  assert.equal(req.expenseQuery.page, 2);
+  assert.equal(req.expenseQuery.limit, 5);
+  assert.equal(req.expenseQuery.sortBy, "amount");
+  assert.equal(req.expenseQuery.sortOrder, "asc");
+  assert.equal(req.expenseQuery.minAmount, 10);
+  assert.equal(req.expenseQuery.maxAmount, 100);
+  assert.equal(req.expenseQuery.startDate.toISOString(), "2026-05-01T00:00:00.000Z");
+  assert.equal(req.expenseQuery.endDate.toISOString(), "2026-05-31T23:59:59.999Z");
+});
+
+test("user schema hardens name and email fields", () => {
+  const namePath = User.schema.path("name");
+  const emailPath = User.schema.path("email");
+  const passwordPath = User.schema.path("password");
+
+  assert.equal(namePath.options.trim, true);
+  assert.equal(namePath.options.minlength, 2);
+  assert.equal(emailPath.options.trim, true);
+  assert.equal(emailPath.options.lowercase, true);
+  assert.match("test@example.com", emailPath.options.match[0]);
+  assert.equal(passwordPath.options.minlength, 6);
+});
+
+test("expense schema hardens fields and includes compound indexes", () => {
+  const titlePath = Expense.schema.path("title");
+  const amountPath = Expense.schema.path("amount");
+  const categoryPath = Expense.schema.path("category");
+  const userPath = Expense.schema.path("user");
+  const indexes = Expense.schema.indexes();
+
+  assert.equal(titlePath.options.trim, true);
+  assert.equal(amountPath.options.min, 0);
+  assert.equal(categoryPath.options.maxlength, 50);
+  assert.equal(userPath.options.required, true);
+  assert.equal(
+    indexes.some(([fields]) => fields.user === 1 && fields.date === -1),
+    true
+  );
+  assert.equal(
+    indexes.some(
+      ([fields]) =>
+        fields.user === 1 && fields.category === 1 && fields.date === -1
+    ),
+    true
+  );
 });
 
 test("registerUser creates a sanitized user response and refresh cookie", async () => {
@@ -314,7 +399,7 @@ test("createExpense trims fields and assigns the authenticated user", async () =
   assert.equal(res.statusCode, 201);
 });
 
-test("getExpenses fetches expenses for the authenticated user in reverse date order", async () => {
+test("getExpenses fetches filtered expenses with pagination metadata", async () => {
   const userId = new mongoose.Types.ObjectId().toString();
   const expenses = [
     { _id: new mongoose.Types.ObjectId(), title: "Rent" },
@@ -322,27 +407,71 @@ test("getExpenses fetches expenses for the authenticated user in reverse date or
   ];
   let queryArg;
   let sortArg;
+  let skipArg;
+  let limitArg;
 
   Expense.find = (query) => {
     queryArg = query;
 
     return {
-      sort: async (arg) => {
+      sort: (arg) => {
         sortArg = arg;
-        return expenses;
+
+        return {
+          skip: (skipValue) => {
+            skipArg = skipValue;
+
+            return {
+              limit: async (limitValue) => {
+                limitArg = limitValue;
+                return expenses;
+              },
+            };
+          },
+        };
       },
     };
   };
+  Expense.countDocuments = async () => 12;
 
-  const req = { user: { id: userId } };
+  const req = {
+    user: { id: userId },
+    expenseQuery: {
+      category: "Food",
+      startDate: new Date("2026-05-01T00:00:00.000Z"),
+      endDate: new Date("2026-05-31T23:59:59.999Z"),
+      minAmount: 20,
+      maxAmount: 500,
+      page: 2,
+      limit: 3,
+      sortBy: "amount",
+      sortOrder: "asc",
+    },
+  };
   const res = createResponse();
 
   await getExpenses(req, res);
 
-  assert.deepEqual(queryArg, { user: userId });
-  assert.deepEqual(sortArg, { date: -1 });
+  assert.equal(queryArg.user, userId);
+  assert.equal(queryArg.category.toString(), "/^Food$/i");
+  assert.equal(queryArg.date.$gte.toISOString(), "2026-05-01T00:00:00.000Z");
+  assert.equal(queryArg.date.$lte.toISOString(), "2026-05-31T23:59:59.999Z");
+  assert.equal(queryArg.amount.$gte, 20);
+  assert.equal(queryArg.amount.$lte, 500);
+  assert.deepEqual(sortArg, { amount: 1 });
+  assert.equal(skipArg, 3);
+  assert.equal(limitArg, 3);
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.expenses.length, 2);
+  assert.deepEqual(res.body.pagination, {
+    page: 2,
+    limit: 3,
+    totalItems: 12,
+    totalPages: 4,
+    hasNextPage: true,
+    hasPreviousPage: true,
+  });
+  assert.deepEqual(res.body.sort, { amount: 1 });
 });
 
 test("updateExpense throws a 404 error when the expense does not exist", async () => {
