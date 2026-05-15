@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { createHash } = require("node:crypto");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
@@ -20,6 +21,8 @@ const {
 const {
   registerUser,
   loginUser,
+  logoutUser,
+  logoutAllSessions,
   refresh,
   getCurrentUser,
 } = require("../controllers/authController");
@@ -34,6 +37,7 @@ const originalUserMethods = {
   findOne: User.findOne,
   create: User.create,
   findById: User.findById,
+  findByIdAndUpdate: User.findByIdAndUpdate,
 };
 
 const originalExpenseMethods = {
@@ -54,6 +58,7 @@ const restoreMocks = () => {
   User.findOne = originalUserMethods.findOne;
   User.create = originalUserMethods.create;
   User.findById = originalUserMethods.findById;
+  User.findByIdAndUpdate = originalUserMethods.findByIdAndUpdate;
 
   Expense.create = originalExpenseMethods.create;
   Expense.find = originalExpenseMethods.find;
@@ -120,10 +125,14 @@ const createRefreshToken = (overrides = {}) =>
       id: overrides.id || new mongoose.Types.ObjectId().toString(),
       name: overrides.name || "Test User",
       email: overrides.email || "test@example.com",
+      tokenId: overrides.tokenId || new mongoose.Types.ObjectId().toString(),
     },
     process.env.JWT_REFRESH_SECRET,
     { expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN }
   );
+
+const hashRefreshToken = (refreshToken) =>
+  createHash("sha256").update(refreshToken).digest("hex");
 
 test.beforeEach(() => {
   restoreMocks();
@@ -202,6 +211,7 @@ test("user schema hardens name and email fields", () => {
   const namePath = User.schema.path("name");
   const emailPath = User.schema.path("email");
   const passwordPath = User.schema.path("password");
+  const refreshTokensPath = User.schema.path("refreshTokens");
 
   assert.equal(namePath.options.trim, true);
   assert.equal(namePath.options.minlength, 2);
@@ -209,6 +219,7 @@ test("user schema hardens name and email fields", () => {
   assert.equal(emailPath.options.lowercase, true);
   assert.match("test@example.com", emailPath.options.match[0]);
   assert.equal(passwordPath.options.minlength, 6);
+  assert.equal(refreshTokensPath.options.select, false);
 });
 
 test("expense schema hardens fields and includes compound indexes", () => {
@@ -238,6 +249,7 @@ test("expense schema hardens fields and includes compound indexes", () => {
 test("registerUser creates a sanitized user response and refresh cookie", async () => {
   const userId = new mongoose.Types.ObjectId();
   let createPayload;
+  let refreshTokenUpdate;
 
   User.findOne = async () => null;
   User.create = async (payload) => {
@@ -249,8 +261,9 @@ test("registerUser creates a sanitized user response and refresh cookie", async 
       updatedAt: new Date("2026-05-09T00:00:00.000Z"),
     };
   };
-  bcrypt.genSalt = async () => "salt";
-  bcrypt.hash = async () => "hashed-password";
+  User.findByIdAndUpdate = async (id, update) => {
+    refreshTokenUpdate = { id, update };
+  };
 
   const req = {
     body: {
@@ -265,12 +278,17 @@ test("registerUser creates a sanitized user response and refresh cookie", async 
 
   assert.equal(createPayload.name, "Jane Doe");
   assert.equal(createPayload.email, "jane@example.com");
-  assert.equal(createPayload.password, "hashed-password");
+  assert.equal(await bcrypt.compare("secret123", createPayload.password), true);
   assert.equal(res.statusCode, 201);
   assert.equal(res.body.user.name, "Jane Doe");
   assert.equal(res.body.user.email, "jane@example.com");
   assert.equal("password" in res.body.user, false);
   assert.equal(res.cookies[0].name, "refreshToken");
+  assert.equal(String(refreshTokenUpdate.id), String(userId));
+  assert.equal(
+    refreshTokenUpdate.update.$push.refreshTokens,
+    hashRefreshToken(res.cookies[0].value)
+  );
 });
 
 test("loginUser rejects invalid credentials", async () => {
@@ -301,10 +319,69 @@ test("loginUser rejects invalid credentials", async () => {
   );
 });
 
-test("refresh returns a new access token from a refresh cookie", async () => {
+test("loginUser stores a hashed refresh token and returns a sanitized user", async () => {
+  const userId = new mongoose.Types.ObjectId();
+  let refreshTokenUpdate;
+
+  User.findOne = async () => ({
+    _id: userId,
+    name: "Jane Doe",
+    email: "jane@example.com",
+    password: await bcrypt.hash("secret123", 10),
+    createdAt: new Date("2026-05-09T00:00:00.000Z"),
+    updatedAt: new Date("2026-05-09T00:00:00.000Z"),
+  });
+  User.findByIdAndUpdate = async (id, update) => {
+    refreshTokenUpdate = { id, update };
+  };
+
+  const res = createResponse();
+
+  await loginUser(
+    {
+      body: {
+        email: "  jane@example.com ",
+        password: "secret123",
+      },
+    },
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.user.email, "jane@example.com");
+  assert.equal("password" in res.body.user, false);
+  assert.equal(res.cookies[0].name, "refreshToken");
+  assert.equal(String(refreshTokenUpdate.id), String(userId));
+  assert.equal(
+    refreshTokenUpdate.update.$push.refreshTokens,
+    hashRefreshToken(res.cookies[0].value)
+  );
+});
+
+test("refresh rotates a stored refresh token and returns a new access token", async () => {
+  const userId = new mongoose.Types.ObjectId().toString();
+  const currentRefreshToken = createRefreshToken({
+    id: userId,
+    name: "Jane Doe",
+    email: "jane@example.com",
+  });
+  let savedTokens;
+
+  User.findById = () => ({
+    select: async () => ({
+      _id: userId,
+      name: "Jane Doe",
+      email: "jane@example.com",
+      refreshTokens: [hashRefreshToken(currentRefreshToken)],
+      save: async function () {
+        savedTokens = [...this.refreshTokens];
+      },
+    }),
+  });
+
   const req = {
     cookies: {
-      refreshToken: createRefreshToken(),
+      refreshToken: currentRefreshToken,
     },
   };
   const res = createResponse();
@@ -314,6 +391,126 @@ test("refresh returns a new access token from a refresh cookie", async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.message, "Token refreshed");
   assert.ok(res.body.accessToken);
+  assert.equal(res.cookies[0].name, "refreshToken");
+  assert.notEqual(res.cookies[0].value, currentRefreshToken);
+  assert.equal(savedTokens.length, 1);
+  assert.equal(savedTokens[0], hashRefreshToken(res.cookies[0].value));
+  assert.notEqual(savedTokens[0], hashRefreshToken(currentRefreshToken));
+});
+
+test("refresh clears sessions when a valid refresh token is not found in storage", async () => {
+  const userId = new mongoose.Types.ObjectId().toString();
+  const storedRefreshToken = createRefreshToken({
+    id: userId,
+    name: "Jane Doe",
+    email: "jane@example.com",
+  });
+  const reusedRefreshToken = createRefreshToken({
+    id: userId,
+    name: "Jane Doe",
+    email: "jane@example.com",
+  });
+  let savedTokens;
+
+  User.findById = () => ({
+    select: async () => ({
+      _id: userId,
+      name: "Jane Doe",
+      email: "jane@example.com",
+      refreshTokens: [hashRefreshToken(storedRefreshToken)],
+      save: async function () {
+        savedTokens = [...this.refreshTokens];
+      },
+    }),
+  });
+
+  const res = createResponse();
+
+  await assert.rejects(
+    () =>
+      refresh(
+        {
+          cookies: {
+            refreshToken: reusedRefreshToken,
+          },
+        },
+        res
+      ),
+    (error) => {
+      assert.equal(error.message, "Unauthorized");
+      assert.equal(error.statusCode, 401);
+      return true;
+    }
+  );
+
+  assert.deepEqual(savedTokens, []);
+  assert.equal(res.clearedCookies[0].name, "refreshToken");
+});
+
+test("logoutUser revokes the current stored refresh token", async () => {
+  const userId = new mongoose.Types.ObjectId().toString();
+  const currentRefreshToken = createRefreshToken({
+    id: userId,
+    name: "Jane Doe",
+    email: "jane@example.com",
+  });
+  let savedTokens;
+
+  User.findById = () => ({
+    select: async () => ({
+      _id: userId,
+      refreshTokens: [hashRefreshToken(currentRefreshToken)],
+      save: async function () {
+        savedTokens = [...this.refreshTokens];
+      },
+    }),
+  });
+
+  const res = createResponse();
+
+  await logoutUser(
+    {
+      cookies: {
+        refreshToken: currentRefreshToken,
+      },
+    },
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(savedTokens, []);
+  assert.equal(res.clearedCookies[0].name, "refreshToken");
+});
+
+test("logoutAllSessions clears every stored refresh token for the user", async () => {
+  const userId = new mongoose.Types.ObjectId().toString();
+  let savedTokens;
+
+  User.findById = () => ({
+    select: async () => ({
+      _id: userId,
+      refreshTokens: ["token-a", "token-b"],
+      save: async function () {
+        savedTokens = [...this.refreshTokens];
+      },
+    }),
+  });
+
+  const res = createResponse();
+
+  await logoutAllSessions(
+    {
+      user: {
+        id: userId,
+      },
+    },
+    res
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(savedTokens, []);
+  assert.equal(res.body.message, "Logged out from all sessions successfully");
+  assert.equal(res.clearedCookies[0].name, "refreshToken");
 });
 
 test("authMiddleware returns unauthorized when the bearer token is missing", async () => {

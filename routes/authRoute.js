@@ -8,6 +8,7 @@ const {
   registerUser,
   loginUser,
   logoutUser,
+  logoutAllSessions,
   refresh,
   getCurrentUser,
 } = require("../controllers/authController");
@@ -15,6 +16,7 @@ const {
 router.post("/register", validateRegister, asyncHandler(registerUser));
 router.post("/login", validateLogin, asyncHandler(loginUser));
 router.post("/logout", asyncHandler(logoutUser));
+router.post("/logout-all", authMiddleware, asyncHandler(logoutAllSessions));
 router.post("/refresh", asyncHandler(refresh));
 router.get("/me", authMiddleware, asyncHandler(getCurrentUser));
 
