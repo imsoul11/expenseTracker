@@ -24,6 +24,12 @@ const userSchema = new mongoose.Schema(
       required: true,
       minlength: 6,
     },
+
+    refreshTokens: {
+      type: [String],
+      default: [],
+      select: false,
+    },
   },
   { timestamps: true }
 );
