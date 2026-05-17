@@ -17,6 +17,7 @@ const {
   validateRegister,
   validateExpenseId,
   validateExpenseQuery,
+  validateExpenseReportQuery,
 } = require("../middleware/validateRequest");
 const {
   registerUser,
@@ -29,6 +30,9 @@ const {
 const {
   createExpense,
   getExpenses,
+  getExpenseSummary,
+  getExpenseCategoryBreakdown,
+  getMonthlyExpenseTrend,
   updateExpense,
   deleteExpense,
 } = require("../controllers/expenseController");
@@ -43,6 +47,7 @@ const originalUserMethods = {
 const originalExpenseMethods = {
   create: Expense.create,
   find: Expense.find,
+  aggregate: Expense.aggregate,
   countDocuments: Expense.countDocuments,
   findOneAndUpdate: Expense.findOneAndUpdate,
   findOneAndDelete: Expense.findOneAndDelete,
@@ -62,6 +67,7 @@ const restoreMocks = () => {
 
   Expense.create = originalExpenseMethods.create;
   Expense.find = originalExpenseMethods.find;
+  Expense.aggregate = originalExpenseMethods.aggregate;
   Expense.countDocuments = originalExpenseMethods.countDocuments;
   Expense.findOneAndUpdate = originalExpenseMethods.findOneAndUpdate;
   Expense.findOneAndDelete = originalExpenseMethods.findOneAndDelete;
@@ -205,6 +211,38 @@ test("validateExpenseQuery normalizes valid filter and sort values", () => {
   assert.equal(req.expenseQuery.maxAmount, 100);
   assert.equal(req.expenseQuery.startDate.toISOString(), "2026-05-01T00:00:00.000Z");
   assert.equal(req.expenseQuery.endDate.toISOString(), "2026-05-31T23:59:59.999Z");
+});
+
+test("validateExpenseReportQuery rejects invalid month windows", () => {
+  const req = {
+    query: {
+      months: "25",
+    },
+  };
+  const next = createNext();
+
+  validateExpenseReportQuery(req, {}, next);
+
+  assert.equal(next.calls.length, 1);
+  assert.equal(next.calls[0].message, "months must be less than or equal to 24");
+});
+
+test("validateExpenseReportQuery normalizes filters and months", () => {
+  const req = {
+    query: {
+      category: " Travel ",
+      months: "3",
+      minAmount: "100",
+    },
+  };
+  const next = createNext();
+
+  validateExpenseReportQuery(req, {}, next);
+
+  assert.deepEqual(next.calls, [null]);
+  assert.equal(req.expenseReportQuery.category, "Travel");
+  assert.equal(req.expenseReportQuery.months, 3);
+  assert.equal(req.expenseReportQuery.minAmount, 100);
 });
 
 test("user schema hardens name and email fields", () => {
@@ -594,6 +632,184 @@ test("createExpense trims fields and assigns the authenticated user", async () =
   assert.equal(createPayload.category, "Food");
   assert.equal(createPayload.user, userId);
   assert.equal(res.statusCode, 201);
+});
+
+test("getExpenseSummary returns aggregated spending metrics", async () => {
+  const userId = new mongoose.Types.ObjectId().toString();
+  let pipelineArg;
+
+  Expense.aggregate = async (pipeline) => {
+    pipelineArg = pipeline;
+
+    return [
+      {
+        totalSpent: 450.5,
+        totalExpenses: 4,
+        averageExpense: 112.625,
+        highestExpense: 200,
+        lowestExpense: 50,
+      },
+    ];
+  };
+
+  const req = {
+    user: { id: userId },
+    expenseReportQuery: {
+      category: "Food",
+      startDate: new Date("2026-05-01T00:00:00.000Z"),
+      endDate: new Date("2026-05-31T23:59:59.999Z"),
+      minAmount: 25,
+      maxAmount: 500,
+      months: 6,
+    },
+  };
+  const res = createResponse();
+
+  await getExpenseSummary(req, res);
+
+  assert.equal(pipelineArg[0].$match.user, userId);
+  assert.equal(pipelineArg[0].$match.category.toString(), "/^Food$/i");
+  assert.equal(pipelineArg[0].$match.date.$gte.toISOString(), "2026-05-01T00:00:00.000Z");
+  assert.equal(pipelineArg[0].$match.date.$lte.toISOString(), "2026-05-31T23:59:59.999Z");
+  assert.equal(pipelineArg[0].$match.amount.$gte, 25);
+  assert.equal(pipelineArg[0].$match.amount.$lte, 500);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.summary, {
+    totalSpent: 450.5,
+    totalExpenses: 4,
+    averageExpense: 112.63,
+    highestExpense: 200,
+    lowestExpense: 50,
+  });
+});
+
+test("getExpenseCategoryBreakdown returns category totals and percentages", async () => {
+  Expense.aggregate = async () => [
+    {
+      _id: "Food",
+      totalSpent: 300,
+      expenseCount: 3,
+      averageExpense: 100,
+    },
+    {
+      _id: "Travel",
+      totalSpent: 100,
+      expenseCount: 2,
+      averageExpense: 50,
+    },
+  ];
+
+  const req = {
+    user: { id: new mongoose.Types.ObjectId().toString() },
+    expenseReportQuery: {
+      category: undefined,
+      startDate: undefined,
+      endDate: undefined,
+      minAmount: undefined,
+      maxAmount: undefined,
+      months: 6,
+    },
+  };
+  const res = createResponse();
+
+  await getExpenseCategoryBreakdown(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.totalSpent, 400);
+  assert.deepEqual(res.body.breakdown, [
+    {
+      category: "Food",
+      totalSpent: 300,
+      expenseCount: 3,
+      averageExpense: 100,
+      percentageOfTotal: 75,
+    },
+    {
+      category: "Travel",
+      totalSpent: 100,
+      expenseCount: 2,
+      averageExpense: 50,
+      percentageOfTotal: 25,
+    },
+  ]);
+});
+
+test("getMonthlyExpenseTrend fills missing months and returns trend summary", async () => {
+  const userId = new mongoose.Types.ObjectId().toString();
+  let pipelineArg;
+
+  Expense.aggregate = async (pipeline) => {
+    pipelineArg = pipeline;
+
+    return [
+      {
+        _id: { year: 2026, month: 1 },
+        totalSpent: 100,
+        expenseCount: 2,
+      },
+      {
+        _id: { year: 2026, month: 3 },
+        totalSpent: 300,
+        expenseCount: 3,
+      },
+    ];
+  };
+
+  const req = {
+    user: { id: userId },
+    expenseReportQuery: {
+      category: undefined,
+      startDate: new Date("2026-01-15T00:00:00.000Z"),
+      endDate: new Date("2026-03-20T00:00:00.000Z"),
+      minAmount: undefined,
+      maxAmount: undefined,
+      months: 3,
+    },
+  };
+  const res = createResponse();
+
+  await getMonthlyExpenseTrend(req, res);
+
+  assert.equal(pipelineArg[0].$match.user, userId);
+  assert.equal(pipelineArg[0].$match.date.$gte.toISOString(), "2026-01-01T00:00:00.000Z");
+  assert.equal(pipelineArg[0].$match.date.$lte.toISOString(), "2026-03-31T23:59:59.999Z");
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.trend, [
+    {
+      month: "2026-01",
+      totalSpent: 100,
+      expenseCount: 2,
+      averageExpense: 50,
+    },
+    {
+      month: "2026-02",
+      totalSpent: 0,
+      expenseCount: 0,
+      averageExpense: 0,
+    },
+    {
+      month: "2026-03",
+      totalSpent: 300,
+      expenseCount: 3,
+      averageExpense: 100,
+    },
+  ]);
+  assert.deepEqual(res.body.summary, {
+    totalSpent: 400,
+    averageMonthlySpend: 133.33,
+    highestMonth: {
+      month: "2026-03",
+      totalSpent: 300,
+      expenseCount: 3,
+      averageExpense: 100,
+    },
+    lowestMonth: {
+      month: "2026-02",
+      totalSpent: 0,
+      expenseCount: 0,
+      averageExpense: 0,
+    },
+  });
 });
 
 test("getExpenses fetches filtered expenses with pagination metadata", async () => {
