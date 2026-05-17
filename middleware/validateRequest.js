@@ -3,6 +3,8 @@ const { Types } = require("mongoose");
 const DEFAULT_EXPENSE_PAGE = 1;
 const DEFAULT_EXPENSE_LIMIT = 10;
 const MAX_EXPENSE_LIMIT = 100;
+const DEFAULT_REPORT_MONTHS = 6;
+const MAX_REPORT_MONTHS = 24;
 const ALLOWED_EXPENSE_SORT_FIELDS = ["date", "amount", "title", "category", "createdAt"];
 const ALLOWED_EXPENSE_SORT_ORDERS = ["asc", "desc"];
 
@@ -44,6 +46,16 @@ const parsePositiveInteger = (value, fieldName, defaultValue, maxValue = Infinit
   return parsedValue;
 };
 
+const parseOptionalPositiveInteger = (value, fieldName, maxValue = Infinity) => {
+  const rawValue = readSingleQueryValue(value, fieldName);
+
+  if (rawValue === undefined || rawValue === "") {
+    return undefined;
+  }
+
+  return parsePositiveInteger(rawValue, fieldName, undefined, maxValue);
+};
+
 const parseOptionalNumber = (value, fieldName) => {
   const rawValue = readSingleQueryValue(value, fieldName);
 
@@ -76,31 +88,14 @@ const parseOptionalDate = (value, fieldName) => {
   return parsedDate;
 };
 
-const normalizeExpenseQuery = (query = {}) => {
+const normalizeExpenseFilters = (query = {}) => {
   const categoryValue = readSingleQueryValue(query.category, "Category");
-  const sortByValue = readSingleQueryValue(query.sortBy, "sortBy");
-  const sortOrderValue = readSingleQueryValue(query.sortOrder, "sortOrder");
 
   const category =
     categoryValue === undefined ? undefined : String(categoryValue).trim();
 
   if (category !== undefined && !category) {
     throw createError("Category must be a non-empty string");
-  }
-
-  const sortBy = sortByValue === undefined || sortByValue === "" ? "date" : sortByValue;
-  if (!ALLOWED_EXPENSE_SORT_FIELDS.includes(sortBy)) {
-    throw createError(
-      `sortBy must be one of: ${ALLOWED_EXPENSE_SORT_FIELDS.join(", ")}`
-    );
-  }
-
-  const sortOrder =
-    sortOrderValue === undefined || sortOrderValue === "" ? "desc" : sortOrderValue;
-  if (!ALLOWED_EXPENSE_SORT_ORDERS.includes(sortOrder)) {
-    throw createError(
-      `sortOrder must be one of: ${ALLOWED_EXPENSE_SORT_ORDERS.join(", ")}`
-    );
   }
 
   const startDate = parseOptionalDate(query.startDate, "startDate");
@@ -119,6 +114,35 @@ const normalizeExpenseQuery = (query = {}) => {
     throw createError("minAmount cannot be greater than maxAmount");
   }
 
+  return {
+    category,
+    startDate,
+    endDate,
+    minAmount,
+    maxAmount,
+  };
+};
+
+const normalizeExpenseQuery = (query = {}) => {
+  const sortByValue = readSingleQueryValue(query.sortBy, "sortBy");
+  const sortOrderValue = readSingleQueryValue(query.sortOrder, "sortOrder");
+  const filters = normalizeExpenseFilters(query);
+
+  const sortBy = sortByValue === undefined || sortByValue === "" ? "date" : sortByValue;
+  if (!ALLOWED_EXPENSE_SORT_FIELDS.includes(sortBy)) {
+    throw createError(
+      `sortBy must be one of: ${ALLOWED_EXPENSE_SORT_FIELDS.join(", ")}`
+    );
+  }
+
+  const sortOrder =
+    sortOrderValue === undefined || sortOrderValue === "" ? "desc" : sortOrderValue;
+  if (!ALLOWED_EXPENSE_SORT_ORDERS.includes(sortOrder)) {
+    throw createError(
+      `sortOrder must be one of: ${ALLOWED_EXPENSE_SORT_ORDERS.join(", ")}`
+    );
+  }
+
   const page = parsePositiveInteger(
     query.page,
     "page",
@@ -132,15 +156,23 @@ const normalizeExpenseQuery = (query = {}) => {
   );
 
   return {
-    category,
-    startDate,
-    endDate,
-    minAmount,
-    maxAmount,
+    ...filters,
     page,
     limit,
     sortBy,
     sortOrder,
+  };
+};
+
+const normalizeExpenseReportQuery = (query = {}) => {
+  const filters = normalizeExpenseFilters(query);
+  const months =
+    parseOptionalPositiveInteger(query.months, "months", MAX_REPORT_MONTHS) ||
+    DEFAULT_REPORT_MONTHS;
+
+  return {
+    ...filters,
+    months,
   };
 };
 
@@ -227,16 +259,30 @@ const validateExpenseQuery = (req, res, next) => {
   }
 };
 
+const validateExpenseReportQuery = (req, res, next) => {
+  try {
+    req.expenseReportQuery = normalizeExpenseReportQuery(req.query);
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   ALLOWED_EXPENSE_SORT_FIELDS,
   DEFAULT_EXPENSE_LIMIT,
   DEFAULT_EXPENSE_PAGE,
+  DEFAULT_REPORT_MONTHS,
   MAX_EXPENSE_LIMIT,
+  MAX_REPORT_MONTHS,
   createError,
+  normalizeExpenseFilters,
   normalizeExpenseQuery,
+  normalizeExpenseReportQuery,
   validateRegister,
   validateLogin,
   validateExpense,
   validateExpenseId,
   validateExpenseQuery,
+  validateExpenseReportQuery,
 };
